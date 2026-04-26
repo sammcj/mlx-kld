@@ -1,0 +1,39 @@
+What is the capital of France?
+Explain photosynthesis in simple terms.
+Write a haiku about the ocean.
+What happens when you divide by zero?
+Sort these numbers from smallest to largest: 42, 17, 8, 99, 3, 56.
+What is the difference between a list and a tuple in Python?
+If a train travels at 60 mph for 2.5 hours, how far does it go?
+Describe the color blue to someone who has never seen it.
+What is the meaning of life?
+Implement a binary search function.
+Summarize the plot of Hamlet in three sentences.
+Is it ethical to lie to protect someone's feelings? Why or why not?
+What is 2^32?
+Write a limerick about a programmer.
+Given the following JSON, extract all email addresses and return them as a Python list: {"users": [{"name": "Alice", "email": "alice@example.com", "age": 30}, {"name": "Bob", "email": "bob@test.org", "age": 25}, {"name": "Carol", "email": "carol@domain.net"}]}
+Write a Python function that takes a list of integers and returns the second largest unique value. Handle edge cases.
+The Eiffel Tower was completed in 1887 and stands 300 meters tall. It was designed by Alexandre Gustave Eiffel for the 1889 World's Fair. How many years after its completion was the World's Fair held, and what is the height in feet?
+Explain the difference between concurrency and parallelism. Give a real-world analogy for each.
+You are a pirate captain. A crew member asks why we should sail north instead of south. Respond in character.
+Convert this SQL query to a pandas equivalent: SELECT department, AVG(salary) as avg_salary FROM employees WHERE hire_date > '2020-01-01' GROUP BY department HAVING AVG(salary) > 50000 ORDER BY avg_salary DESC;
+A farmer has 100 meters of fencing and wants to enclose a rectangular area against a river (so only 3 sides need fencing). What dimensions maximize the enclosed area?
+Rewrite this function to be more efficient: def find_duplicates(lst): duplicates = [] for i in range(len(lst)): for j in range(i+1, len(lst)): if lst[i] == lst[j] and lst[i] not in duplicates: duplicates.append(lst[i]) return duplicates
+Here is a passage from a technical document: "The transformer architecture employs multi-head self-attention mechanisms that allow the model to jointly attend to information from different representation subspaces at different positions. Unlike recurrent neural networks, transformers process all positions simultaneously, enabling significantly more parallelization during training. The key innovation is the scaled dot-product attention: Attention(Q,K,V) = softmax(QK^T / sqrt(d_k))V, where d_k is the dimension of the key vectors." Summarize the key points and explain the attention formula.
+Debug this code and explain what's wrong: async function fetchUserData(userId) { const response = fetch(`/api/users/${userId}`); const data = response.json(); return data; }
+I need to calculate the 95th percentile of response times from this dataset: [45, 62, 78, 91, 103, 55, 67, 82, 150, 43, 58, 71, 88, 95, 110, 48, 73, 86, 99, 205, 52, 64, 77, 84, 92, 101, 115, 130, 47, 69]. Show the calculation step by step.
+Explain the CAP theorem in distributed systems. Which two properties does a typical SQL database prioritize, and why?
+Compare and contrast gradient descent, Adam, and RMSprop optimizers. When would you choose each?
+Write a recursive descent parser for simple arithmetic expressions (addition, multiplication, parentheses) in Python.
+You have a dataset with 10,000 rows and 50 features. 30% of the values are missing. Describe your approach to handling the missing data before training a random forest model. Consider different types of missingness.
+What is the time complexity of the following code? Explain your reasoning: def mystery(n): if n <= 1: return 1 return mystery(n-1) + mystery(n-1)
+Review this Dockerfile and suggest improvements: FROM ubuntu:latest RUN apt-get update RUN apt-get install -y python3 python3-pip RUN pip3 install flask gunicorn requests numpy pandas COPY . /app WORKDIR /app EXPOSE 8080 CMD python3 app.py
+What is the time complexity of finding the median of two sorted arrays of size n and m? Walk through the binary-search-based optimal solution.
+Debug this Python code: def merge_sorted(a, b): result = []; i = j = 0; while i < len(a) and j < len(b): if a[i] < b[j]: result.append(a[i]); i += 1; else: result.append(b[j]); j += 1; return result. Identify any issues and provide a corrected version.
+Explain CRDTs (conflict-free replicated data types) using a counter as the canonical example. What guarantees do they provide for distributed systems?
+Compare the actor model in Erlang versus the goroutine model in Go for building a chat server. Discuss fault tolerance and message-passing semantics.
+Describe quantization-aware training versus post-training quantization. When would you choose one over the other for a 7B-parameter model targeting Apple Silicon?
+What's the difference between SSE, WebSockets, and long polling? Give a concrete recommendation for a real-time stock ticker serving 100k concurrent clients.
+Implement a debounce function in JavaScript that supports both leading and trailing edge invocation. Include TypeScript types.
+What is the worst-case time complexity of inserting into a hash table with chaining, and what causes it? Give a one-sentence answer.
