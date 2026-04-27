@@ -228,6 +228,33 @@ The methodology here borrows from a few specific places. If you're trying to rep
 
 ---
 
+## Some of the changes to mlx-kld since forking
+
+**New capabilities**
+
+- Long-mode evaluation (`--long`, `--long-corpus`, `--long-ctx`, `--long-chunks`): streams a corpus through each model in fixed-context chunks, scoring only the second half per the `llama.cpp` perplexity convention. Default corpus is WikiText-2 raw test split. Much more stable than short mode on close pairs. `--short --long` runs both and stratifies the output.
+- Top-K sparse reference cache (`--top-k-cache`): K largest log-probs per position plus a tail-mass scalar. ~500-1000x smaller than dense, ~3-5% systematic underestimate, rank-preserving.
+- Chunked forward pass with shared KV state via `mlx_lm.models.cache.make_prompt_cache`. Allows prompts longer than peak memory would otherwise permit; numerically equivalent to un-chunked (regression test pinned).
+- `mlx_kld.model_info`: size, effective bpw, quant family detection (RTN uniform/mixed, Unsloth Dynamic, AutoRound, oQ, DWQ, DFlash, unquantised), per-tensor bit distribution and tensor-role breakdown (attention/MLP/embed/lm_head/SSM/router/shared_expert), weights index SHA, mtime.
+- Prefill tok/s captured per comparison.
+- Markdown report (`--markdown`, `--render-markdown-from`): pure renderer so the same code can drive a future web UI. With both modes present, the headline stacks two per-mode tables.
+- Pareto-style quality-vs-size chart (`--chart`, `--render-chart-from`): X = mean KLD (log), Y = size GB, points labelled `creator/model`, family-coloured and shape-coded for greyscale and colour-blind safety. matplotlib is an optional `[chart]` extra.
+- Reference cache save/load (`--save-reference` / `--load-reference`). Per-mode token IDs and `score_start` stored in the cache, so `--short --long` round-trips both regimes.
+- `--json-summary-only` for slim summary JSON.
+
+**Bug fixes**
+
+- `--load-reference` was silently re-tokenising with the comparison tokeniser, biasing every KL number. Now uses cached reference token IDs verbatim.
+- Original chunked forward pass discarded cross-chunk attention. Replaced with prompt-cache-driven chunking.
+- Chart legend was showing an "Other" entry when self-comparison rows got filtered; now derived from plotted rows only.
+
+**Misc**
+
+- Added tests.
+- Diversified `sample_prompts/prompts.txt`.
+
+---
+
 ## Future Enhancements
 
 Ordered by value × feasibility. The first three would meaningfully improve the *credibility* of any claim made with the tool — they let you say "A is significantly better than B" rather than just "A scored lower on this run".

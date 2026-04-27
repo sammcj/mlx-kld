@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from .report import (
@@ -12,6 +13,20 @@ from .report import (
 )
 # .compare is imported lazily inside main() so render-only paths
 # (--render-chart-from / --render-markdown-from) don't trigger MLX/Metal init.
+
+
+def _format_duration(seconds: float) -> str:
+    """Render a duration in human-friendly h/m/s form.
+
+    Examples: 4.2s → "4.2s", 75 → "1m 15s", 3725 → "1h 2m 5s".
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {sec}s"
 
 
 def _model_slug(model_path: str) -> str:
@@ -294,6 +309,18 @@ def _print_summary_table(results) -> None:
 
 
 def main():
+    run_start = time.time()
+    try:
+        _main_body()
+    finally:
+        elapsed = time.time() - run_start
+        # Skip the elapsed line for trivial paths (argparse --help, bad-args
+        # validation exits) so they don't get a noisy "Total elapsed: 0.0s".
+        if elapsed >= 1.0:
+            print(f"\nTotal elapsed: {_format_duration(elapsed)}", file=sys.stderr)
+
+
+def _main_body() -> None:
     parser = argparse.ArgumentParser(
         prog="mlx-kld",
         description="Measure KL divergence between MLX language model output distributions.",
@@ -654,6 +681,26 @@ def main():
         long_n_ctx=args.long_ctx,
         long_num_chunks=args.long_chunks,
     )
+
+    # Highlight any models that compare() skipped due to load/eval errors.
+    # These are still in args.compare but not in results — the user should
+    # see at-a-glance which ones didn't make it.
+    completed = {r.compare_model for r in results}
+    skipped = [m for m in args.compare if m not in completed]
+    if skipped:
+        print(
+            f"\nSkipped {len(skipped)}/{len(args.compare)} model(s) due to errors "
+            "(see 'ERROR ...' lines above for details):",
+            file=sys.stderr,
+        )
+        for m in skipped:
+            print(f"  - {m}", file=sys.stderr)
+    if not results:
+        print(
+            "\nNo models completed successfully — nothing to report.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Print results for each model
     for result in results:

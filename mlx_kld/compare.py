@@ -501,105 +501,124 @@ def compare(
             )
 
     # --- Phase 2: Loop over comparison models ---
+    # Each model is wrapped in try/except: if loading or evaluation fails for
+    # one quant (incompatible weights layout, OOM, missing files, …) we log
+    # the failure, free any partial state, and continue with the rest. A
+    # 20-minute multi-model run shouldn't be wiped by one bad input.
     results: list[ComparisonResult] = []
 
     for cmp_idx, comparison in enumerate(comparisons):
         _log(f"\nLoading comparison model [{cmp_idx + 1}/{len(comparisons)}]: {comparison}")
-        cmp_info_obj = extract_model_info(comparison)
-        compare_info = cmp_info_obj.to_dict()
-        _log(f"  {cmp_info_obj.short_summary()}")
-        mx.reset_peak_memory()
-        t0 = time.time()
-        cmp_model, cmp_tokenizer, *_ = mlx_load(comparison)
-        load_time = time.time() - t0
-        peak_mem = mx.get_peak_memory() / 1e9
-        _log(f"  Loaded in {load_time:.1f}s (peak memory: {peak_mem:.1f} GB)")
+        cmp_model = None
+        cmp_tokenizer = None
+        try:
+            cmp_info_obj = extract_model_info(comparison)
+            compare_info = cmp_info_obj.to_dict()
+            _log(f"  {cmp_info_obj.short_summary()}")
+            mx.reset_peak_memory()
+            t0 = time.time()
+            cmp_model, cmp_tokenizer, *_ = mlx_load(comparison)
+            load_time = time.time() - t0
+            peak_mem = mx.get_peak_memory() / 1e9
+            _log(f"  Loaded in {load_time:.1f}s (peak memory: {peak_mem:.1f} GB)")
 
-        # Use the *reference* token ids verbatim. Re-tokenising with the
-        # comparison tokenizer can produce a different sequence (different
-        # chat template, vocab quirks, etc.) which silently misaligns
-        # positions and turns KL into noise. The whole point of the
-        # comparison is to feed both models the same input.
-        cmp_prepared = prepared
+            # Use the *reference* token ids verbatim. Re-tokenising with the
+            # comparison tokenizer can produce a different sequence (different
+            # chat template, vocab quirks, etc.) which silently misaligns
+            # positions and turns KL into noise. The whole point of the
+            # comparison is to feed both models the same input.
+            cmp_prepared = prepared
 
-        _log(f"Computing KL divergence for {len(prepared)} prompt(s)...")
-        cmp_timing = _ForwardTiming()
-        prompt_results: list[PromptResult] = []
-        for i, (ref_entry, p) in enumerate(zip(ref_entries, cmp_prepared)):
-            cmp_log_probs = _collect_log_probs(
-                cmp_model, p["token_ids"],
-                chunk_tokens=chunk_tokens, timing=cmp_timing,
-            )
-
-            ref_seq_len = (
-                ref_entry.seq_len
-                if isinstance(ref_entry, SparseLogProbs)
-                else ref_entry.shape[0]
-            )
-            if ref_seq_len != cmp_log_probs.shape[0]:
-                _log(
-                    f"  WARNING: Token count mismatch for prompt {i + 1}: "
-                    f"ref={ref_seq_len}, cmp={cmp_log_probs.shape[0]}. "
-                    f"Truncating to shorter."
+            _log(f"Computing KL divergence for {len(prepared)} prompt(s)...")
+            cmp_timing = _ForwardTiming()
+            prompt_results: list[PromptResult] = []
+            for i, (ref_entry, p) in enumerate(zip(ref_entries, cmp_prepared)):
+                cmp_log_probs = _collect_log_probs(
+                    cmp_model, p["token_ids"],
+                    chunk_tokens=chunk_tokens, timing=cmp_timing,
                 )
-                min_len = min(ref_seq_len, cmp_log_probs.shape[0])
-                cmp_log_probs = cmp_log_probs[:min_len]
-                if isinstance(ref_entry, SparseLogProbs):
-                    ref_entry = SparseLogProbs(
-                        log_probs=ref_entry.log_probs[:min_len],
-                        indices=ref_entry.indices[:min_len],
-                        tail_log_mass=ref_entry.tail_log_mass[:min_len],
-                        vocab_size=ref_entry.vocab_size,
+
+                ref_seq_len = (
+                    ref_entry.seq_len
+                    if isinstance(ref_entry, SparseLogProbs)
+                    else ref_entry.shape[0]
+                )
+                if ref_seq_len != cmp_log_probs.shape[0]:
+                    _log(
+                        f"  WARNING: Token count mismatch for prompt {i + 1}: "
+                        f"ref={ref_seq_len}, cmp={cmp_log_probs.shape[0]}. "
+                        f"Truncating to shorter."
                     )
-                else:
-                    ref_entry = ref_entry[:min_len]
+                    min_len = min(ref_seq_len, cmp_log_probs.shape[0])
+                    cmp_log_probs = cmp_log_probs[:min_len]
+                    if isinstance(ref_entry, SparseLogProbs):
+                        ref_entry = SparseLogProbs(
+                            log_probs=ref_entry.log_probs[:min_len],
+                            indices=ref_entry.indices[:min_len],
+                            tail_log_mass=ref_entry.tail_log_mass[:min_len],
+                            vocab_size=ref_entry.vocab_size,
+                        )
+                    else:
+                        ref_entry = ref_entry[:min_len]
 
-            per_token_kld = compute_kld_auto(ref_entry, cmp_log_probs)
-            _log(
-                f"  [{i + 1}/{len(prepared)}] {len(per_token_kld)} tokens, "
-                f"mean KLD: {np.mean(per_token_kld):.6f}"
-            )
+                per_token_kld = compute_kld_auto(ref_entry, cmp_log_probs)
+                _log(
+                    f"  [{i + 1}/{len(prepared)}] {len(per_token_kld)} tokens, "
+                    f"mean KLD: {np.mean(per_token_kld):.6f}"
+                )
 
-            # mode + score_start come from the prepared entry: quick prompts
-            # get SKIP_FIRST_TOKENS_SHORT, long-mode chunks get n_ctx/2.
-            # Older saved caches predate these fields — default to quick.
-            mode = p.get("mode", MODE_SHORT)
-            score_start_raw = p.get(
-                "score_start",
-                min(SKIP_FIRST_TOKENS_SHORT, max(0, len(per_token_kld) - 1)),
-            )
-            # Clamp so we always score at least one position (defends against
-            # a long-mode chunk that ended up shorter than n_ctx).
-            score_start = max(0, min(int(score_start_raw), max(0, len(per_token_kld) - 1)))
-            prompt_results.append(
-                PromptResult(
-                    prompt=p["prompt"],
-                    num_tokens=len(per_token_kld),
-                    per_token_kld=per_token_kld,
-                    token_ids=np.array(p["token_ids"][: len(per_token_kld)]),
-                    token_strings=p["token_strings"][: len(per_token_kld)],
-                    score_start=score_start,
-                    mode=mode,
+                # mode + score_start come from the prepared entry: quick prompts
+                # get SKIP_FIRST_TOKENS_SHORT, long-mode chunks get n_ctx/2.
+                # Older saved caches predate these fields — default to quick.
+                mode = p.get("mode", MODE_SHORT)
+                score_start_raw = p.get(
+                    "score_start",
+                    min(SKIP_FIRST_TOKENS_SHORT, max(0, len(per_token_kld) - 1)),
+                )
+                # Clamp so we always score at least one position (defends against
+                # a long-mode chunk that ended up shorter than n_ctx).
+                score_start = max(0, min(int(score_start_raw), max(0, len(per_token_kld) - 1)))
+                prompt_results.append(
+                    PromptResult(
+                        prompt=p["prompt"],
+                        num_tokens=len(per_token_kld),
+                        per_token_kld=per_token_kld,
+                        token_ids=np.array(p["token_ids"][: len(per_token_kld)]),
+                        token_strings=p["token_strings"][: len(per_token_kld)],
+                        score_start=score_start,
+                        mode=mode,
+                    )
+                )
+
+            _log(f"  Compare prefill: {cmp_timing.total_tokens} tokens "
+                 f"in {cmp_timing.total_seconds:.1f}s = {cmp_timing.tokens_per_second:.1f} tok/s")
+
+            results.append(
+                ComparisonResult(
+                    reference_model=reference,
+                    compare_model=comparison,
+                    prompt_results=prompt_results,
+                    reference_info=reference_info,
+                    compare_info=compare_info,
+                    prefill_tokens_per_second=cmp_timing.tokens_per_second,
+                    prefill_seconds=cmp_timing.total_seconds,
                 )
             )
-
-        _log(f"  Compare prefill: {cmp_timing.total_tokens} tokens "
-             f"in {cmp_timing.total_seconds:.1f}s = {cmp_timing.tokens_per_second:.1f} tok/s")
-        _log(f"Unloading comparison model: {comparison}")
-        del cmp_model
-        del cmp_tokenizer
-        _unload_model()
-
-        results.append(
-            ComparisonResult(
-                reference_model=reference,
-                compare_model=comparison,
-                prompt_results=prompt_results,
-                reference_info=reference_info,
-                compare_info=compare_info,
-                prefill_tokens_per_second=cmp_timing.tokens_per_second,
-                prefill_seconds=cmp_timing.total_seconds,
+        except Exception as exc:  # noqa: BLE001 — we want the broad catch
+            # Most likely shape mismatch in mlx_load (incompatible quant layout),
+            # OOM, missing weights, or unsupported architecture. None of those
+            # should kill an N-model run.
+            _log(
+                f"  ERROR loading or evaluating {comparison}: "
+                f"{type(exc).__name__}: {exc}"
             )
-        )
+            _log(f"  → skipping this model and continuing with the rest.")
+        finally:
+            _log(f"Unloading comparison model: {comparison}")
+            if cmp_model is not None:
+                del cmp_model
+            if cmp_tokenizer is not None:
+                del cmp_tokenizer
+            _unload_model()
 
     return results
