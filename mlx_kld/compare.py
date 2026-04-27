@@ -14,13 +14,16 @@ import numpy as np
 from mlx_lm import load as mlx_load
 
 from .metrics import (
+    MODE_LONG,
+    MODE_SHORT,
+    SKIP_FIRST_TOKENS_SHORT,
     ComparisonResult,
     PromptResult,
     SparseLogProbs,
     compute_kld_auto,
     sparsify_log_probs,
 )
-from .model_info import ModelInfo, extract_model_info
+from .model_info import extract_model_info
 
 
 def _log(msg: str) -> None:
@@ -33,9 +36,10 @@ def _prepare_prompts(
     prompts: list[str],
     use_chat_template: bool = True,
 ) -> list[dict]:
-    """Tokenize prompts, optionally applying the chat template.
+    """Tokenize quick-mode prompts, optionally applying the chat template.
 
-    Returns a list of dicts with 'prompt', 'token_ids', 'token_strings'.
+    Returns a list of dicts with 'prompt', 'token_ids', 'token_strings',
+    'mode', 'score_start'.
     """
     prepared = []
     for prompt in prompts:
@@ -49,16 +53,91 @@ def _prepare_prompts(
             token_ids = tokenizer.encode(prompt)
 
         token_strings = [tokenizer.decode([tid]) for tid in token_ids]
+        # Clamp so very short prompts still score at least one position.
+        score_start = min(SKIP_FIRST_TOKENS_SHORT, max(0, len(token_ids) - 1))
 
         prepared.append(
             {
                 "prompt": prompt,
                 "token_ids": token_ids,
                 "token_strings": token_strings,
+                "mode": MODE_SHORT,
+                "score_start": score_start,
             }
         )
 
     return prepared
+
+
+def _prepare_streamed_chunks(
+    tokenizer,
+    corpus_text: str,
+    n_ctx: int,
+    num_chunks: int,
+) -> list[dict]:
+    """Tokenise a corpus end-to-end and split into back-to-back chunks.
+
+    The whole corpus is tokenised in one call so BPE merges are consistent
+    across chunk boundaries (re-tokenising each chunk in isolation can yield
+    different splits at the seams). Each chunk is then handed to the compare
+    loop as a separate prepared entry with mode=MODE_LONG and
+    score_start=n_ctx/2 — the llama.cpp convention of scoring only the
+    second half of each chunk so every scored token has full left-context.
+
+    Args:
+        tokenizer: An mlx_lm TokenizerWrapper or HF tokenizer with .encode().
+        corpus_text: Raw text of the corpus.
+        n_ctx: Chunk size in tokens.
+        num_chunks: Number of chunks to take from the start of the corpus.
+
+    Returns:
+        List of prepared chunk dicts, each carrying its own mode and
+        score_start so the compare loop can score it correctly.
+    """
+    if n_ctx <= 0:
+        raise ValueError(f"n_ctx must be > 0, got {n_ctx}")
+    if num_chunks <= 0:
+        raise ValueError(f"num_chunks must be > 0, got {num_chunks}")
+
+    # Tokenise the whole corpus once. add_special_tokens=False so we don't
+    # inject BOS/EOS into the middle of the chunk stream — we want the raw
+    # token sequence the model would see if it were continuing the text.
+    try:
+        all_tokens = tokenizer.encode(corpus_text, add_special_tokens=False)
+    except TypeError:
+        # Older tokeniser wrappers don't expose the keyword; fall back.
+        all_tokens = tokenizer.encode(corpus_text)
+
+    if len(all_tokens) < n_ctx:
+        raise ValueError(
+            f"Corpus too short: {len(all_tokens)} tokens < n_ctx={n_ctx}"
+        )
+
+    available = len(all_tokens) // n_ctx
+    take = min(num_chunks, available)
+    if take < num_chunks:
+        _log(
+            f"  note: corpus only has {available} full chunks at n_ctx={n_ctx}; "
+            f"taking {take} (requested {num_chunks})"
+        )
+
+    score_start = n_ctx // 2
+    chunks: list[dict] = []
+    for i in range(take):
+        start = i * n_ctx
+        end = start + n_ctx
+        chunk_ids = list(all_tokens[start:end])
+        chunk_strings = [tokenizer.decode([tid]) for tid in chunk_ids]
+        chunks.append(
+            {
+                "prompt": f"[wikitext chunk {i + 1}/{take}, n_ctx={n_ctx}]",
+                "token_ids": chunk_ids,
+                "token_strings": chunk_strings,
+                "mode": MODE_LONG,
+                "score_start": score_start,
+            }
+        )
+    return chunks
 
 
 def _logits_to_log_probs_np(logits: mx.array) -> np.ndarray:
@@ -194,6 +273,10 @@ def save_reference(
                 "prompt": p["prompt"],
                 "token_ids": p["token_ids"],
                 "token_strings": p["token_strings"],
+                # Mode + score_start need to round-trip so a cache containing
+                # long-mode chunks still scores correctly on reload.
+                "mode": p.get("mode", MODE_SHORT),
+                "score_start": p.get("score_start", 0),
             }
             for p in prepared
         ],
@@ -295,27 +378,46 @@ def compare(
     load_ref: str | Path | None = None,
     sparse_k: int = 0,
     chunk_tokens: int = 0,
+    long_corpus_path: str | Path | None = None,
+    long_n_ctx: int = 2048,
+    long_num_chunks: int = 32,
 ) -> list[ComparisonResult]:
     """Compare one or more models against a reference by measuring KL divergence.
 
     Reference logits are collected once (or loaded from disk) and reused for
     every comparison model, so the reference model is never loaded twice.
 
+    Two prompt regimes are supported and may be mixed in one run:
+
+    - **Quick mode** (the ``prompts`` argument): a list of discrete prompts
+      tokenised with the reference tokeniser (and optionally the chat
+      template). Score positions [SKIP_FIRST_TOKENS_SHORT, num_tokens).
+
+    - **Long mode** (``long_corpus_path``): a single text corpus tokenised
+      end-to-end and split into ``long_num_chunks`` back-to-back windows of
+      ``long_n_ctx`` tokens. Each chunk is scored from position
+      ``long_n_ctx // 2`` onwards (the llama.cpp convention) so every scored
+      token has at least n_ctx/2 tokens of left-context, removing the
+      position-0 noise that dominates short-prompt KL.
+
     Args:
-        reference: Path or HF repo for the reference model. Ignored if load_ref
-            is provided.
+        reference: Path or HF repo for the reference model.
         comparisons: List of paths/HF repos for the models to compare.
-        prompts: List of prompt strings to evaluate.
-        use_chat_template: Whether to apply the model's chat template.
-        save_ref: If provided, save reference logits to this path after
-            collecting them (so future runs can skip the reference model).
-        load_ref: If provided, load previously saved reference logits from
-            this path instead of running the reference model.
-        sparse_k: If > 0, store the reference cache as top-K sparse log-probs
-            with K=sparse_k. Reduces cache size by ~vocab_size/k (typically
-            1000x) with negligible KL approximation error.
-        chunk_tokens: If > 0, split forward passes into chunks of this many
-            tokens to reduce peak activation memory on long prompts.
+        prompts: Discrete prompts to evaluate in quick mode. May be empty
+            if only long mode is wanted.
+        use_chat_template: Whether to apply the model's chat template to
+            quick-mode prompts. Long-mode chunks never use a template.
+        save_ref: If provided, save reference logits to this path.
+        load_ref: If provided, load saved reference logits from this path.
+        sparse_k: Top-K sparse log-prob cache; 0 = full vocab.
+        chunk_tokens: Forward-pass chunking for activation-memory limits.
+            Independent of long_n_ctx (which controls evaluation chunking).
+        long_corpus_path: If provided, additionally evaluate the streamed
+            long-mode corpus at this path.
+        long_n_ctx: Window size for long-mode chunks. Default 2048 matches
+            the GPTQ/AWQ academic convention.
+        long_num_chunks: Number of chunks to take from the start of the
+            corpus. Default 32 is a sensible balance of stability and runtime.
 
     Returns:
         List of ComparisonResult, one per comparison model, in input order.
@@ -330,6 +432,18 @@ def compare(
                 "  Note: --load-reference includes its own prompts; "
                 "--prompts / --prompts-file will be ignored."
             )
+        # Long-mode evaluation needs reference logits over the long corpus.
+        # Adding them on the fly would require reloading the reference model,
+        # which defeats --load-reference. If the loaded cache doesn't already
+        # contain long-mode chunks, fail loudly rather than silently skipping.
+        if long_corpus_path is not None:
+            has_long = any(p.get("mode") == MODE_LONG for p in prepared)
+            if not has_long:
+                raise ValueError(
+                    "--long was requested but the loaded reference cache contains "
+                    "no long-mode entries. Either rebuild the cache with --long "
+                    "(omit --load-reference) or drop --long from this invocation."
+                )
     else:
         _log(f"Loading reference model: {reference}")
         ref_info_obj = extract_model_info(reference)
@@ -343,7 +457,18 @@ def compare(
 
         prepared = _prepare_prompts(ref_tokenizer, prompts, use_chat_template)
 
-        _log(f"Collecting reference logits for {len(prompts)} prompt(s)...")
+        if long_corpus_path is not None:
+            corpus_text = Path(long_corpus_path).read_text()
+            long_chunks = _prepare_streamed_chunks(
+                ref_tokenizer, corpus_text, long_n_ctx, long_num_chunks,
+            )
+            _log(
+                f"  long mode: {len(long_chunks)} chunk(s) at n_ctx={long_n_ctx} "
+                f"(score positions >= {long_n_ctx // 2})"
+            )
+            prepared.extend(long_chunks)
+
+        _log(f"Collecting reference logits for {len(prepared)} item(s)...")
         ref_timing = _ForwardTiming()
         ref_entries: list = []
         for i, p in enumerate(prepared):
@@ -359,7 +484,7 @@ def compare(
                 del log_probs
             else:
                 ref_entries.append(log_probs)
-            _log(f"  [{i + 1}/{len(prompts)}] {len(p['token_ids'])} tokens")
+            _log(f"  [{i + 1}/{len(prepared)}] {len(p['token_ids'])} tokens")
         _log(f"  Reference prefill: {ref_timing.total_tokens} tokens "
              f"in {ref_timing.total_seconds:.1f}s = {ref_timing.tokens_per_second:.1f} tok/s")
 
@@ -435,6 +560,17 @@ def compare(
                 f"mean KLD: {np.mean(per_token_kld):.6f}"
             )
 
+            # mode + score_start come from the prepared entry: quick prompts
+            # get SKIP_FIRST_TOKENS_SHORT, long-mode chunks get n_ctx/2.
+            # Older saved caches predate these fields — default to quick.
+            mode = p.get("mode", MODE_SHORT)
+            score_start_raw = p.get(
+                "score_start",
+                min(SKIP_FIRST_TOKENS_SHORT, max(0, len(per_token_kld) - 1)),
+            )
+            # Clamp so we always score at least one position (defends against
+            # a long-mode chunk that ended up shorter than n_ctx).
+            score_start = max(0, min(int(score_start_raw), max(0, len(per_token_kld) - 1)))
             prompt_results.append(
                 PromptResult(
                     prompt=p["prompt"],
@@ -442,6 +578,8 @@ def compare(
                     per_token_kld=per_token_kld,
                     token_ids=np.array(p["token_ids"][: len(per_token_kld)]),
                     token_strings=p["token_strings"][: len(per_token_kld)],
+                    score_start=score_start,
+                    mode=mode,
                 )
             )
 

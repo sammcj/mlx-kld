@@ -409,3 +409,57 @@ def test_inference_table_sorted_by_tok_s_desc(three_models):
     assert "`models/B`" in body[0]
     assert "`models/C`" in body[1]
     assert "`models/A`" in body[2]
+
+
+def test_summary_renders_stratified_when_both_modes_present():
+    """When summary_by_mode has both 'short' and 'long', the headline section
+    should render two per-mode tables instead of the single combined one."""
+    d = _result_dict(name="A", mean_kld=0.05)
+    d["summary"]["mode"] = "long"
+    d["summary_by_mode"] = {
+        "short": {
+            "num_prompts": 49, "total_tokens": 2000, "scored_tokens": 1600,
+            "mean_kld": 0.04, "median_kld": 0.03, "std_kld": 0.02,
+            "max_kld": 0.40, "p95_kld": 0.10, "p99_kld": 0.20,
+        },
+        "long": {
+            "num_prompts": 32, "total_tokens": 65536, "scored_tokens": 32768,
+            "mean_kld": 0.05, "median_kld": 0.04, "std_kld": 0.03,
+            "max_kld": 0.50, "p95_kld": 0.12, "p99_kld": 0.25,
+        },
+    }
+    data = report_data_from_results([d])
+    md = _render_summary_table(data)
+    assert "Short mode" in md
+    assert "Long mode" in md
+    assert "0.04000" in md  # short mean
+    assert "0.05000" in md  # long mean
+
+
+def test_summary_renders_single_table_when_only_one_mode():
+    """No summary_by_mode block (or only one populated) → original single-table layout."""
+    d = _result_dict(name="A", mean_kld=0.05)
+    # No summary_by_mode at all (back-compat with pre-stratification JSONs)
+    data = report_data_from_results([d])
+    md = _render_summary_table(data)
+    assert "Short mode" not in md
+    assert "Long mode" not in md
+    assert "0.05000" in md
+
+
+def test_row_picks_long_as_primary_mode_when_long_stats_present():
+    """Primary mode falls back to 'long' when summary.mode is missing but
+    summary_by_mode.long has data."""
+    d = _result_dict(name="A", mean_kld=0.05)
+    d["summary_by_mode"] = {
+        "short": None,
+        "long": {
+            "num_prompts": 32, "total_tokens": 65536, "scored_tokens": 32768,
+            "mean_kld": 0.05, "median_kld": 0.04, "std_kld": 0.03,
+            "max_kld": 0.50, "p95_kld": 0.12, "p99_kld": 0.25,
+        },
+    }
+    data = report_data_from_results([d])
+    assert data.rows[0].primary_mode == "long"
+    assert data.rows[0].long_stats is not None
+    assert data.rows[0].short_stats is None

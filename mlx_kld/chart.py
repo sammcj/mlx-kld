@@ -67,6 +67,56 @@ def _creator_slash_model(path: str) -> str:
     return name
 
 
+def _pick_label_offsets(plottable: list[dict], ax) -> list[tuple]:
+    """Choose a label offset per point that avoids overlapping any other marker.
+
+    Tries right → left → above → below in order; falls back to right if all
+    four positions collide. Uses display (pixel) coords so it works with the
+    log-scaled x-axis. Approximates label width from character count and
+    fontsize=9; marker radius is generous to account for the s=180 dot.
+    """
+    marker_disp = ax.transData.transform(
+        [(r["mean_kld"], r["size_gb"]) for r in plottable]
+    )
+    marker_radius_px = 14
+    char_width_px = 6.0
+    label_height_px = 12
+    candidates: list[tuple[tuple[int, int], str, str]] = [
+        ((10, 0), "left", "center"),
+        ((-10, 0), "right", "center"),
+        ((0, 12), "center", "bottom"),
+        ((0, -12), "center", "top"),
+    ]
+    chosen: list[tuple] = []
+    for i, r in enumerate(plottable):
+        label_w = max(40, len(r["name"]) * char_width_px)
+        my_x, my_y = marker_disp[i]
+        for offset, ha, va in candidates:
+            lx, ly = my_x + offset[0], my_y + offset[1]
+            x0 = (lx - label_w if ha == "right"
+                  else lx - label_w / 2 if ha == "center"
+                  else lx)
+            x1 = x0 + label_w
+            y0 = (ly - label_height_px if va == "top"
+                  else ly - label_height_px / 2 if va == "center"
+                  else ly)
+            y1 = y0 + label_height_px
+            collides = False
+            for j, (jx, jy) in enumerate(marker_disp):
+                if j == i:
+                    continue
+                if not (x1 < jx - marker_radius_px or x0 > jx + marker_radius_px
+                        or y1 < jy - marker_radius_px or y0 > jy + marker_radius_px):
+                    collides = True
+                    break
+            if not collides:
+                chosen.append((offset, ha, va))
+                break
+        else:
+            chosen.append(((10, 0), "left", "center"))
+    return chosen
+
+
 def _row_from_result_dict(d: dict) -> Optional[dict]:
     """Extract chartable fields from a result JSON or in-memory ComparisonResult dict."""
     summary = d.get("summary") or {}
@@ -76,12 +126,18 @@ def _row_from_result_dict(d: dict) -> Optional[dict]:
     if mean is None:
         return None
     cmp_path = d.get("compare_model") or cmp_info.get("path") or ""
+    by_mode = d.get("summary_by_mode") or {}
     return {
         "name": _creator_slash_model(cmp_path),
         "mean_kld": float(mean),
         "median_kld": summary.get("median_kld"),
         "p99_kld": summary.get("p99_kld"),
         "max_kld": summary.get("max_kld"),
+        # Per-mode stats so the chart can plot the more rigorous mode when
+        # both ran.
+        "mode": summary.get("mode") or ("long" if by_mode.get("long") else "short"),
+        "short_stats": by_mode.get("short"),
+        "long_stats": by_mode.get("long"),
         # Comparison-model metadata (annotations beside each point)
         "size_gb": cmp_info.get("size_gb"),
         "bpw": cmp_info.get("effective_bpw"),
@@ -163,10 +219,12 @@ def render_quality_chart(
     fig, ax = plt.subplots(figsize=(11.0, 6.5))
     fig.subplots_adjust(left=0.10, right=0.78, top=0.86, bottom=0.13)
 
-    # Sort once by KLD so the alternating-label offset below has a stable order.
+    # Sort once by KLD so collision detection has a stable order.
     plottable.sort(key=lambda r: r["mean_kld"])
 
-    for i, r in enumerate(plottable):
+    # Pass 1: plot markers only. Labels need final axis limits to compute
+    # display-space collision boxes, so we annotate after limits are set.
+    for r in plottable:
         family = r.get("family", "unknown")
         style = FAMILY_STYLE.get(family, FAMILY_STYLE["unknown"])
         ax.scatter(
@@ -175,20 +233,6 @@ def render_quality_chart(
             edgecolors="#222222", linewidths=0.7,
             zorder=3,
         )
-        # Alternate label position around each dot (above-right vs below-right)
-        # to reduce overlap when two models cluster at similar (KLD, size).
-        if i % 2 == 0:
-            xytext = (10, 6)
-            va = "bottom"
-        else:
-            xytext = (10, -6)
-            va = "top"
-        ax.annotate(
-            r["name"],
-            (r["mean_kld"], r["size_gb"]),
-            xytext=xytext, textcoords="offset points",
-            ha="left", va=va, fontsize=9, color="#222222",
-        )
 
     # Axes
     ax.set_xscale("log")
@@ -196,7 +240,7 @@ def render_quality_chart(
         "Mean KL divergence vs reference  (log scale, lower is better)",
         fontsize=10, labelpad=8,
     )
-    ax.set_ylabel("Size on disk (GB)  ·  proxy for decode speed (smaller = faster)",
+    ax.set_ylabel("Size on disk (GB)  ·  higher = more memory & likely slower",
                   fontsize=10, labelpad=8)
     ax.tick_params(axis="both", labelsize=9)
 
@@ -212,6 +256,17 @@ def render_quality_chart(
     ymin, ymax = ax.get_ylim()
     ax.set_ylim(max(0, ymin - 2), ymax + 2)
 
+    # Pass 2: place labels using collision-aware offsets so a label never sits
+    # on top of another marker. Tries right → left → above → below in order.
+    label_offsets = _pick_label_offsets(plottable, ax)
+    for r, (offset, ha, va) in zip(plottable, label_offsets):
+        ax.annotate(
+            r["name"],
+            (r["mean_kld"], r["size_gb"]),
+            xytext=offset, textcoords="offset points",
+            ha=ha, va=va, fontsize=9, color="#222222",
+        )
+
     # Pareto-region cue: faint shaded triangle in the lower-left
     ax.text(
         0.02, 0.04,
@@ -220,10 +275,13 @@ def render_quality_chart(
         ha="left", va="bottom", style="italic",
     )
 
-    # Title
+    # Title — include the evaluation mode so a long-mode chart is never
+    # mistaken for a short-mode one (or vice versa).
     ref_name = Path(plottable[0].get("reference_model") or "").name or "reference"
+    mode = plottable[0].get("mode") or "short"
+    mode_label = "long-mode (WikiText-2 streamed)" if mode == "long" else "short-mode prompts"
     if title is None:
-        title = f"Quantisation quality vs size — {ref_name}"
+        title = f"Quantisation quality vs size — {ref_name}  ·  {mode_label}"
     ax.set_title(title, fontsize=13, weight="bold", loc="left", pad=18)
 
     # Subtitle (date/sha if reference_info was captured at run time)

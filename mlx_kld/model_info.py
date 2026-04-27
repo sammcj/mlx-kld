@@ -224,20 +224,42 @@ def _detect_quant_family(model_path: Path, quant_cfg: dict, num_overrides: int) 
 def _estimate_param_count(text_cfg: dict) -> Optional[int]:
     """Rough parameter count from architecture config.
 
-    Approximation that covers attention + MLP + embedding parameters for a
-    standard transformer; useful for computing effective bpw. Not exact —
-    ignores LayerNorm, tied weights, position embeddings, etc.
+    Covers attention (with GQA) + MLP (dense or MoE) + embedding parameters.
+    Used only for computing effective bpw, so a few percent error from
+    LayerNorms, tied weights, hybrid SSM layers, etc. is fine.
     """
     h = text_cfg.get("hidden_size")
     n = text_cfg.get("num_hidden_layers")
     v = text_cfg.get("vocab_size")
-    inter = text_cfg.get("intermediate_size")
-    if not (h and n and v and inter):
+    if not (h and n and v):
         return None
+
+    # Attention block: respect grouped-query attention via num_key_value_heads.
+    num_heads = text_cfg.get("num_attention_heads") or 1
+    num_kv = text_cfg.get("num_key_value_heads") or num_heads
+    head_dim = text_cfg.get("head_dim") or (h // num_heads if num_heads else h)
+    q_dim = num_heads * head_dim
+    kv_dim = num_kv * head_dim
+    attn_per_layer = h * q_dim + 2 * h * kv_dim + q_dim * h  # Q, K, V, O
+
+    # MLP block: dense (intermediate_size) or MoE (num_experts × moe_intermediate_size,
+    # plus optional shared expert and router gate).
+    inter = text_cfg.get("intermediate_size")
+    num_experts = text_cfg.get("num_experts")
+    moe_inter = text_cfg.get("moe_intermediate_size")
+    shared_inter = text_cfg.get("shared_expert_intermediate_size")
+    if inter:
+        mlp_per_layer = 3 * h * inter
+    elif num_experts and moe_inter:
+        mlp_per_layer = num_experts * 3 * h * moe_inter
+        if shared_inter:
+            mlp_per_layer += 3 * h * shared_inter
+        mlp_per_layer += h * num_experts  # router gate
+    else:
+        return None
+
     embed = v * h
-    # Per-layer: 4 attention projections (h*h) + 3 MLP projections (h*inter)
-    per_layer = 4 * h * h + 3 * h * inter
-    return embed + n * per_layer + v * h  # + lm_head (untied)
+    return embed + n * (attn_per_layer + mlp_per_layer) + v * h  # + lm_head (untied)
 
 
 def extract_model_info(model_path: str) -> ModelInfo:

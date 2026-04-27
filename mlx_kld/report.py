@@ -45,7 +45,13 @@ _EMPTY = "—"
 
 @dataclass
 class ReportRow:
-    """One comparison model's entry in the report."""
+    """One comparison model's entry in the report.
+
+    Headline KLD fields (``mean_kld`` etc.) reflect the primary mode for that
+    row — long if long-mode data is present, otherwise short. Per-mode raw
+    stats are kept in ``short_stats`` / ``long_stats`` so the renderer can
+    show stratified tables when both modes ran.
+    """
 
     name: str
     full_path: str
@@ -68,6 +74,9 @@ class ReportRow:
     tok_s: float | None
     quality_per_bit: float | None
     tok_s_per_gb: float | None
+    primary_mode: str = "short"
+    short_stats: dict | None = None
+    long_stats: dict | None = None
 
 
 @dataclass
@@ -151,6 +160,10 @@ def _row_from_result(d: dict) -> ReportRow | None:
     tok_s = summary.get("prefill_tokens_per_second")
     sha = cmp_info.get("weights_index_sha")
     mtime = cmp_info.get("weights_mtime_iso")
+    by_mode = d.get("summary_by_mode") or {}
+    short_stats = by_mode.get("short")
+    long_stats = by_mode.get("long")
+    primary_mode = summary.get("mode") or ("long" if long_stats else "short")
     return ReportRow(
         name=name,
         full_path=full_path,
@@ -173,6 +186,9 @@ def _row_from_result(d: dict) -> ReportRow | None:
         tok_s=float(tok_s) if tok_s is not None else None,
         quality_per_bit=(float(mean) / float(bpw)) if bpw else None,
         tok_s_per_gb=(float(tok_s) / float(size_gb)) if (tok_s and size_gb) else None,
+        primary_mode=primary_mode,
+        short_stats=short_stats,
+        long_stats=long_stats,
     )
 
 
@@ -441,6 +457,34 @@ def _render_chart_link(data: ReportData) -> str:
 
 
 def _render_summary_table(data: ReportData) -> str:
+    """Render the headline KLD summary.
+
+    When both short and long modes have data, render two stacked tables (one
+    per mode) so the reader can see how each quant ranks under each regime.
+    Otherwise render a single combined table — the original layout — using
+    the per-row primary mode's numbers.
+    """
+    has_short = any(r.short_stats for r in data.rows)
+    has_long = any(r.long_stats for r in data.rows)
+
+    if has_short and has_long:
+        out = [
+            "## Headline summary",
+            "",
+            (
+                "Two evaluation modes ran. Short-mode and long-mode means are "
+                "not directly comparable — they sample different regimes — but "
+                "rank-ordering across quants should agree if the quant has no "
+                "long-context-specific failure mode."
+            ),
+            "",
+            _render_per_mode_table(data, "short"),
+            "",
+            _render_per_mode_table(data, "long"),
+        ]
+        return "\n".join(out) + "\n"
+
+    # Single-mode case (the original layout).
     headers = [
         "Model", "Size", "Eff. bpw",
         "Mean KLD", "Median KLD", "P95 KLD", "P99 KLD", "Max KLD",
@@ -466,6 +510,47 @@ def _render_summary_table(data: ReportData) -> str:
         out.append("")
         out.append("★ = best on that metric. (Lowest KLD is best; highest tok/s is best.)")
     return "\n".join(out) + "\n"
+
+
+def _render_per_mode_table(data: ReportData, mode: str) -> str:
+    """Render a KLD table for a single mode (``"short"`` or ``"long"``)."""
+    label = "Short mode" if mode == "short" else "Long mode"
+    headers = [
+        "Model", "Size", "Eff. bpw",
+        "Mean KLD", "Median KLD", "P95 KLD", "P99 KLD", "Max KLD",
+    ]
+    # Best-per-column for this mode.
+    rows_with_stats = [
+        (i, r) for i, r in enumerate(data.rows)
+        if (r.short_stats if mode == "short" else r.long_stats)
+    ]
+    if not rows_with_stats:
+        return f"### {label}\n\n(no data)\n"
+    best: dict[str, int] = {}
+    for col in ("mean_kld", "median_kld", "p95_kld", "p99_kld", "max_kld"):
+        candidates = [
+            (s.get(col), i) for i, r in rows_with_stats
+            for s in [r.short_stats if mode == "short" else r.long_stats]
+            if s and s.get(col) is not None
+        ]
+        if candidates:
+            best[col] = min(candidates)[1]
+    body: list[list[str]] = []
+    for i, r in rows_with_stats:
+        s = r.short_stats if mode == "short" else r.long_stats
+        if not s:
+            continue
+        body.append([
+            f"`{r.name}`",
+            _fmt_size(r.size_gb),
+            _fmt_bpw(r.bpw),
+            _star(_fmt_kld(s.get("mean_kld")), best.get("mean_kld") == i),
+            _star(_fmt_kld(s.get("median_kld")), best.get("median_kld") == i),
+            _star(_fmt_kld(s.get("p95_kld")), best.get("p95_kld") == i),
+            _star(_fmt_kld(s.get("p99_kld")), best.get("p99_kld") == i),
+            _star(_fmt_kld(s.get("max_kld")), best.get("max_kld") == i),
+        ])
+    return f"### {label}\n\n{_md_table(headers, body)}\n"
 
 
 def _render_quality_per_bit_table(data: ReportData) -> str:

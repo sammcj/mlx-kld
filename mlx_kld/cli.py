@@ -16,6 +16,45 @@ def _model_slug(model_path: str) -> str:
     return Path(model_path).name
 
 
+def _merge_existing_into_result(result, out_path: Path) -> None:
+    """If ``out_path`` is a previous run's JSON for the same model, merge any
+    modes the current run *didn't* cover into ``result`` so writing the new
+    JSON preserves them.
+
+    Modes covered by the current run win — we never overwrite fresh numbers
+    with stale ones.
+    """
+    if not out_path.exists():
+        return
+    try:
+        existing = json.loads(out_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    result.merge_external_modes_from_dict(existing)
+
+
+def _filter_dflash(paths: list[str], *, kind: str) -> list[str]:
+    """Drop any path whose leaf name contains 'dflash' (case-insensitive).
+
+    DFlash variants are speculative-decoding draft models — prefill KLD against
+    a regular reference doesn't measure anything meaningful for them.
+    """
+    kept, dropped = [], []
+    for p in paths:
+        if "dflash" in Path(p).name.lower():
+            dropped.append(p)
+        else:
+            kept.append(p)
+    if dropped:
+        print(
+            f"  note: skipping {len(dropped)} DFlash model(s) from {kind} "
+            f"(speculative-decoding drafts; prefill KLD doesn't apply): "
+            + ", ".join(Path(p).name for p in dropped),
+            file=sys.stderr,
+        )
+    return kept
+
+
 def _short_info(info: dict) -> str:
     """Compact one-line summary of a model_info dict for terminal display."""
     if not info:
@@ -41,6 +80,8 @@ def _short_info(info: dict) -> str:
 
 def _print_results(result, top_k: int = 0) -> None:
     """Print formatted results for a single comparison to stdout."""
+    from .metrics import MODE_LONG, MODE_SHORT
+
     s = result
 
     print(f"\n{'=' * 50}")
@@ -59,29 +100,49 @@ def _print_results(result, top_k: int = 0) -> None:
         print(f"  Prefill:     {s.prefill_tokens_per_second:.1f} tok/s "
               f"({s.prefill_seconds:.1f}s on {s.total_tokens} tokens)")
     print(f"{'─' * 50}")
-    print(f"  Mean KLD:    {s.mean_kld:.6f}")
-    print(f"  Median KLD:  {s.median_kld:.6f}")
-    print(f"  Std KLD:     {s.std_kld:.6f}")
-    print(f"  P95 KLD:     {s.percentile(95):.6f}")
-    print(f"  P99 KLD:     {s.percentile(99):.6f}")
-    print(f"  Max KLD:     {s.max_kld:.6f}")
 
-    # Find which prompt/token has the max
-    max_prompt_idx = 0
-    max_pos = 0
-    max_val = 0.0
-    for i, pr in enumerate(s.prompt_results):
-        if pr.max_kld > max_val:
-            max_val = pr.max_kld
-            max_prompt_idx = i
-            max_pos = pr.max_kld_position
+    short_stats = s.stats_for_mode(MODE_SHORT)
+    long_stats = s.stats_for_mode(MODE_LONG)
+    if short_stats and long_stats:
+        # Both modes present: show per-mode tables. Don't print a combined
+        # summary number — averaging different sample regimes is misleading.
+        for label, stats in (("Short mode", short_stats), ("Long mode", long_stats)):
+            print(f"  {label}  ({stats['scored_tokens']} scored tokens)")
+            print(f"    Mean KLD:   {stats['mean_kld']:.6f}")
+            print(f"    Median KLD: {stats['median_kld']:.6f}")
+            print(f"    P95 KLD:    {stats['p95_kld']:.6f}")
+            print(f"    P99 KLD:    {stats['p99_kld']:.6f}")
+            print(f"    Max KLD:    {stats['max_kld']:.6f}")
+    else:
+        print(f"  Mode:        {s.primary_mode}")
+        print(f"  Mean KLD:    {s.mean_kld:.6f}")
+        print(f"  Median KLD:  {s.median_kld:.6f}")
+        print(f"  Std KLD:     {s.std_kld:.6f}")
+        print(f"  P95 KLD:     {s.percentile(95):.6f}")
+        print(f"  P99 KLD:     {s.percentile(99):.6f}")
+        print(f"  Max KLD:     {s.max_kld:.6f}")
 
-    max_pr = s.prompt_results[max_prompt_idx]
-    max_tok = max_pr.token_strings[max_pos] if max_pr.token_strings else "?"
-    print(
-        f"             (prompt {max_prompt_idx + 1}, "
-        f'position {max_pos}, token "{max_tok.strip()}")'
-    )
+    # Find which prompt/token has the max in this run's data.
+    if s.prompt_results:
+        max_prompt_idx = 0
+        max_pos = 0
+        max_val = 0.0
+        for i, pr in enumerate(s.prompt_results):
+            if pr.max_kld > max_val:
+                max_val = pr.max_kld
+                max_prompt_idx = i
+                max_pos = pr.max_kld_position
+
+        max_pr = s.prompt_results[max_prompt_idx]
+        max_tok = (
+            max_pr.token_strings[max_pos]
+            if max_pr.token_strings and max_pos < len(max_pr.token_strings)
+            else "?"
+        )
+        print(
+            f"             (prompt {max_prompt_idx + 1}, "
+            f'position {max_pos}, token "{max_tok.strip()}")'
+        )
     print(f"{'=' * 50}")
 
     # Per-prompt breakdown
@@ -157,8 +218,17 @@ def _print_summary_table(results) -> None:
         metric_rows["Prefill tok/s"].append(r.prefill_tokens_per_second or 0.0)
 
     sep = "  "
+    # When both modes ran, the per-row stats fall back to the primary mode
+    # (long). Label the table so a reader looking at numbers in isolation
+    # knows which regime they're from.
+    primary_modes = {r.primary_mode for r in results}
+    mode_label = (
+        f" ({primary_modes.pop()} mode)"
+        if len(primary_modes) == 1
+        else ""
+    )
     print(f"\n{'=' * 50}")
-    print(f"  Summary Comparison")
+    print(f"  Summary Comparison{mode_label}")
     print(f"{'=' * 50}")
     print(sep.join(header_parts))
     print(sep.join(divider_parts))
@@ -218,7 +288,63 @@ def main():
         "--prompts-file",
         type=str,
         default=None,
-        help="Path to a text file with one prompt per line.",
+        help=(
+            "Path to a text file with one prompt per line. "
+            "Takes precedence over --short / --long when given. "
+            "If neither this, --prompts, --short, nor --long is given, "
+            "--short is the default and the bundled sample_prompts/prompts.txt loads."
+        ),
+    )
+    parser.add_argument(
+        "--short",
+        action="store_true",
+        help=(
+            "Run the short-prompt mode (the bundled sample_prompts/prompts.txt set). "
+            "This is the default if no prompt source is specified. "
+            "May be combined with --long to run both regimes in one invocation."
+        ),
+    )
+    parser.add_argument(
+        "--long",
+        action="store_true",
+        help=(
+            "Run the long-mode streamed-corpus evaluation (WikiText-2 chunked at "
+            "n_ctx tokens, scoring only the second half of each chunk per the "
+            "llama.cpp convention). Numbers from this mode are methodologically "
+            "comparable to published GPTQ/AWQ/llama.cpp tables. May be combined "
+            "with --short."
+        ),
+    )
+    parser.add_argument(
+        "--long-corpus",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Override the long-mode corpus path. "
+            "Defaults to the bundled corpora/wiki.test.raw."
+        ),
+    )
+    parser.add_argument(
+        "--long-ctx",
+        type=int,
+        default=2048,
+        metavar="N",
+        help=(
+            "Long-mode chunk size in tokens. Default 2048 (GPTQ/AWQ academic "
+            "convention). Each chunk scores positions [N/2, N)."
+        ),
+    )
+    parser.add_argument(
+        "--long-chunks",
+        type=int,
+        default=32,
+        metavar="N",
+        help=(
+            "Number of long-mode chunks to take from the start of the corpus. "
+            "Default 32 (~32k scored tokens at the default n_ctx — tight SE "
+            "without bloating runtime)."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -400,7 +526,37 @@ def main():
         print("Error: provide at least one model via --compare.", file=sys.stderr)
         sys.exit(1)
 
-    # Collect prompts (ignored if --load-reference is used)
+    # DFlash variants are speculative-execution draft models, not standard MLX
+    # quants — prefill KLD against a normal reference is a category error, so
+    # we always exclude them.
+    args.compare = _filter_dflash(args.compare, kind="--compare")
+    if args.reference and "dflash" in Path(args.reference).name.lower():
+        print(
+            f"Error: --reference cannot be a DFlash model ({args.reference}). "
+            "DFlash variants are speculative-execution drafts, not regular quants.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not args.compare:
+        print("Error: no comparison models left after DFlash filter.", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve which evaluation modes to run.
+    #
+    # Precedence:
+    #   - explicit --prompts / --prompts-file overrides everything (literal)
+    #   - --long alone runs only long mode
+    #   - --short or default (no flags) runs only short mode
+    #   - --short --long runs both
+    #
+    # The default is short-only because it's the fast smoke test (~2 min for
+    # 5 models). --long is opt-in.
+    repo_root = Path(__file__).resolve().parent.parent
+    sample_dir = repo_root / "sample_prompts"
+    explicit_prompts = bool(args.prompts) or bool(args.prompts_file)
+    run_short = args.short or (not args.long and not explicit_prompts)
+    run_long = args.long
+
     prompts = list(args.prompts)
     if args.prompts_file:
         pf = Path(args.prompts_file)
@@ -410,10 +566,43 @@ def main():
         prompts.extend(
             line.strip() for line in pf.read_text().splitlines() if line.strip()
         )
+    elif run_short and args.load_reference is None:
+        default_pf = sample_dir / "prompts.txt"
+        if not default_pf.exists():
+            print(
+                f"Error: --short requested but {default_pf} is missing.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        lines = [
+            line.strip() for line in default_pf.read_text().splitlines() if line.strip()
+        ]
+        print(f"  short mode: loaded {len(lines)} prompt(s) from {default_pf.name}")
+        prompts.extend(lines)
 
-    if args.load_reference is None and not prompts:
+    # Resolve long-mode corpus path.
+    long_corpus_path: str | None = None
+    if run_long:
+        if args.long_corpus:
+            resolved = args.long_corpus
+        else:
+            default_corpus = repo_root / "corpora" / "wiki.test.raw"
+            if not default_corpus.exists():
+                print(
+                    f"Error: --long requested but bundled corpus is missing: {default_corpus}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            resolved = str(default_corpus)
+        long_corpus_path = resolved
         print(
-            "Error: provide at least one prompt via --prompts or --prompts-file.",
+            f"  long mode: corpus={Path(resolved).name}, "
+            f"n_ctx={args.long_ctx}, chunks={args.long_chunks}"
+        )
+
+    if args.load_reference is None and not prompts and not run_long:
+        print(
+            "Error: nothing to evaluate. Pass --short, --long, --prompts, or --prompts-file.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -429,6 +618,9 @@ def main():
         load_ref=args.load_reference,
         sparse_k=args.top_k_cache,
         chunk_tokens=args.chunk_tokens,
+        long_corpus_path=long_corpus_path,
+        long_n_ctx=args.long_ctx,
+        long_num_chunks=args.long_chunks,
     )
 
     # Print results for each model
@@ -439,23 +631,25 @@ def main():
     if len(results) > 1:
         _print_summary_table(results)
 
-    # Save JSON output
+    # Save JSON output. Before writing each file, splice in any other-mode
+    # data from a prior invocation's JSON so running --short and --long in
+    # separate invocations leaves both sets of numbers in the final file.
     if args.output:
         out_prefix = Path(args.output)
         detail = not args.json_summary_only
         if len(results) == 1:
-            # Single model: save to the exact path given
             out_path = out_prefix.with_suffix(".json") if out_prefix.suffix != ".json" else out_prefix
+            _merge_existing_into_result(results[0], out_path)
             out_path.write_text(json.dumps(
                 results[0].to_dict(detail=detail, top_k=args.top_k),
                 indent=2,
             ))
             print(f"Results saved to {out_path}", file=sys.stderr)
         else:
-            # Multiple models: one file per model using prefix + slug
             for result in results:
                 slug = _model_slug(result.compare_model)
                 out_path = out_prefix.parent / f"{out_prefix.name}_{slug}.json"
+                _merge_existing_into_result(result, out_path)
                 out_path.write_text(json.dumps(
                     result.to_dict(detail=detail, top_k=args.top_k),
                     indent=2,

@@ -1,0 +1,42 @@
+WikiText-2 (raw v1) — license and attribution
+=============================================
+
+The file `wiki.test.raw` in this directory is the test split of the
+WikiText-2 raw v1 corpus, redistributed here under its original licence
+to provide a reproducible default evaluation corpus for `mlx-kld`'s
+`--long` streamed mode.
+
+Source
+------
+- Paper: Stephen Merity, Caiming Xiong, James Bradbury, Richard Socher.
+  "Pointer Sentinel Mixture Models". ICLR 2017.
+  https://arxiv.org/abs/1609.07843
+- Original release: Salesforce Research.
+- This file mirrors the version distributed at:
+  https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+  (the same archive used by llama.cpp's `scripts/get-wikitext-2.sh`).
+
+Underlying content
+------------------
+WikiText-2 is derived from verified Good and Featured articles on the
+English Wikipedia. Wikipedia text is dual-licensed under the
+Creative Commons Attribution-ShareAlike 4.0 International Licence
+(CC BY-SA 4.0) and the GNU Free Documentation Licence (GFDL).
+
+Licence
+-------
+The corpus is redistributed under the Creative Commons Attribution
+ShareAlike Licence: https://creativecommons.org/licenses/by-sa/4.0/
+
+If you redistribute this file or derived works, you must:
+  - Give appropriate credit to the original Wikipedia contributors and
+    to Merity et al. for the curated WikiText-2 release.
+  - Indicate if changes were made.
+  - Distribute under the same licence (CC BY-SA 4.0).
+
+Why it lives here
+-----------------
+Bundling the corpus avoids a runtime download dependency, makes the
+`--long` mode reproducible offline, and matches the corpus used by
+llama.cpp's `llama-perplexity` so numbers are at least methodologically
+comparable to published llama.cpp scoreboards.

@@ -6,6 +6,21 @@ from typing import Union
 import numpy as np
 
 
+# In short-prompt scoring we drop the first few token positions when
+# aggregating into the summary mean/percentiles. Position 0..SKIP_FIRST-1
+# have very little left-context, so per-token KL there is dominated by the
+# unconditioned-distribution prior over sentence-openers — noise that
+# doesn't reflect quantisation behaviour. The unscored positions are still
+# kept in the per-token detail array for diagnostics.
+SKIP_FIRST_TOKENS_SHORT = 8
+
+# Mode tags used to stratify summaries. "short" = list of discrete prompts,
+# scored from SKIP_FIRST_TOKENS_SHORT. "long" = streamed corpus chunks at
+# fixed n_ctx, scored only from n_ctx/2 onwards (llama.cpp convention).
+MODE_SHORT = "short"
+MODE_LONG = "long"
+
+
 @dataclass
 class SparseLogProbs:
     """Top-K log-probs from a reference forward pass.
@@ -47,42 +62,82 @@ class TokenDivergence:
 
 @dataclass
 class PromptResult:
-    """KLD results for a single prompt."""
+    """KLD results for a single prompt or chunk.
+
+    ``score_start`` is the first position whose KL counts toward the summary
+    statistics. Positions [0, score_start) are kept in ``per_token_kld``
+    for diagnostics but excluded from mean/percentile aggregation. For short
+    prompts this is SKIP_FIRST_TOKENS_SHORT; for streamed long-mode chunks
+    it is n_ctx/2.
+    """
 
     prompt: str
     num_tokens: int
     per_token_kld: np.ndarray  # shape: (num_tokens,)
     token_ids: np.ndarray  # shape: (num_tokens,)
     token_strings: list[str] = field(default_factory=list)
+    score_start: int = 0
+    mode: str = MODE_SHORT
+
+    @property
+    def scored_kld(self) -> np.ndarray:
+        """Per-token KL restricted to positions that count toward summaries."""
+        if self.score_start <= 0:
+            return self.per_token_kld
+        return self.per_token_kld[self.score_start:]
+
+    @property
+    def num_scored_tokens(self) -> int:
+        return int(self.scored_kld.shape[0])
 
     @property
     def mean_kld(self) -> float:
-        return float(np.mean(self.per_token_kld))
+        s = self.scored_kld
+        return float(np.mean(s)) if s.size else 0.0
 
     @property
     def max_kld(self) -> float:
-        return float(np.max(self.per_token_kld))
+        s = self.scored_kld
+        return float(np.max(s)) if s.size else 0.0
 
     @property
     def max_kld_position(self) -> int:
-        return int(np.argmax(self.per_token_kld))
+        """Position (in the original token sequence) of the max scored KL."""
+        s = self.scored_kld
+        if not s.size:
+            return 0
+        return int(np.argmax(s)) + self.score_start
 
     @property
     def median_kld(self) -> float:
-        return float(np.median(self.per_token_kld))
+        s = self.scored_kld
+        return float(np.median(s)) if s.size else 0.0
 
     def top_k_divergent(self, k: int = 10) -> list[TokenDivergence]:
-        """Return the top-k most divergent token positions."""
-        k = min(k, len(self.per_token_kld))
-        indices = np.argsort(self.per_token_kld)[-k:][::-1]
+        """Return the top-k most divergent token positions among scored ones."""
+        s = self.scored_kld
+        k = min(k, len(s))
+        if k <= 0:
+            return []
+        indices = np.argsort(s)[-k:][::-1]
         results = []
         for idx in indices:
-            tok_str = self.token_strings[idx] if self.token_strings else ""
+            absolute_pos = int(idx) + self.score_start
+            tok_str = (
+                self.token_strings[absolute_pos]
+                if self.token_strings and absolute_pos < len(self.token_strings)
+                else ""
+            )
+            tok_id = (
+                int(self.token_ids[absolute_pos])
+                if absolute_pos < len(self.token_ids)
+                else -1
+            )
             results.append(
                 TokenDivergence(
-                    position=int(idx),
-                    kld=float(self.per_token_kld[idx]),
-                    token_id=int(self.token_ids[idx]),
+                    position=absolute_pos,
+                    kld=float(s[idx]),
+                    token_id=tok_id,
                     token_str=tok_str,
                 )
             )
@@ -91,7 +146,13 @@ class PromptResult:
 
 @dataclass
 class ComparisonResult:
-    """Aggregate KLD results across all prompts."""
+    """Aggregate KLD results across all prompts.
+
+    ``prompt_results`` may mix entries from quick and long modes. Summary
+    properties default to the *primary* mode: long if any long entries are
+    present, otherwise quick. Per-mode summaries are exposed via the
+    ``stats_for_mode`` helper and the JSON ``summary_by_mode`` block.
+    """
 
     reference_model: str
     compare_model: str
@@ -102,61 +163,166 @@ class ComparisonResult:
     prefill_tokens_per_second: float | None = None
     prefill_seconds: float | None = None
 
+    # Modes whose stats came from a previous invocation's JSON (not run this
+    # time). Lets a `--long`-only run preserve the `--short` numbers from a
+    # prior run when writing JSON / rendering reports.
+    external_mode_stats: dict = field(default_factory=dict)
+    # Same idea for the per-prompt entries from the other-mode prior run, so
+    # detail JSON survives across separate invocations. Each entry is the
+    # raw prompt-entry dict as it appeared in the previous JSON.
+    external_prompt_entries: list = field(default_factory=list)
+
+    @property
+    def primary_mode(self) -> str:
+        """Long if any long data is present (run-now or external), else quick."""
+        has_long = (
+            any(r.mode == MODE_LONG for r in self.prompt_results)
+            or self.external_mode_stats.get(MODE_LONG) is not None
+        )
+        return MODE_LONG if has_long else MODE_SHORT
+
+    def _results_for_mode(self, mode: str) -> list[PromptResult]:
+        return [r for r in self.prompt_results if r.mode == mode]
+
+    def _scored_kld_for_mode(self, mode: str) -> np.ndarray:
+        results = self._results_for_mode(mode)
+        if not results:
+            return np.array([], dtype=np.float64)
+        return np.concatenate([r.scored_kld for r in results])
+
     @property
     def all_kld(self) -> np.ndarray:
-        """Concatenate all per-token KLD values."""
-        return np.concatenate([r.per_token_kld for r in self.prompt_results])
+        """Scored per-token KL values for the primary mode (in-memory only)."""
+        return self._scored_kld_for_mode(self.primary_mode)
 
     @property
     def total_tokens(self) -> int:
+        """Total tokens across all results (sum of all per-prompt token counts)."""
         return sum(r.num_tokens for r in self.prompt_results)
+
+    def _primary_stat(self, key: str) -> float:
+        """Return ``key`` from the primary mode's stats.
+
+        Computes from in-memory results when present; otherwise falls back to
+        external_mode_stats (carried in from a prior invocation's JSON). This
+        keeps the headline ComparisonResult.mean_kld / .max_kld / etc. properties
+        meaningful even when only the *other* mode ran fresh this time.
+        """
+        stats = self.stats_for_mode(self.primary_mode)
+        if not stats:
+            return 0.0
+        return float(stats.get(key, 0.0))
 
     @property
     def mean_kld(self) -> float:
-        return float(np.mean(self.all_kld))
+        return self._primary_stat("mean_kld")
 
     @property
     def median_kld(self) -> float:
-        return float(np.median(self.all_kld))
+        return self._primary_stat("median_kld")
 
     @property
     def std_kld(self) -> float:
-        return float(np.std(self.all_kld))
+        return self._primary_stat("std_kld")
 
     @property
     def max_kld(self) -> float:
-        return float(np.max(self.all_kld))
+        return self._primary_stat("max_kld")
 
     def percentile(self, p: float) -> float:
-        return float(np.percentile(self.all_kld, p))
+        # Only p95/p99 are pre-computed in stats; for others fall back to in-memory.
+        if int(p) == 95:
+            return self._primary_stat("p95_kld")
+        if int(p) == 99:
+            return self._primary_stat("p99_kld")
+        a = self.all_kld
+        return float(np.percentile(a, p)) if a.size else 0.0
+
+    def stats_for_mode(self, mode: str) -> dict | None:
+        """Return summary stats for ``mode``.
+
+        Falls back to ``external_mode_stats`` (loaded from a prior invocation's
+        JSON) if the current run produced no results in that mode.
+        """
+        results = self._results_for_mode(mode)
+        if results:
+            scored = self._scored_kld_for_mode(mode)
+            if scored.size:
+                return {
+                    "num_prompts": len(results),
+                    "total_tokens": sum(r.num_tokens for r in results),
+                    "scored_tokens": int(scored.size),
+                    "mean_kld": float(np.mean(scored)),
+                    "median_kld": float(np.median(scored)),
+                    "std_kld": float(np.std(scored)),
+                    "max_kld": float(np.max(scored)),
+                    "p95_kld": float(np.percentile(scored, 95)),
+                    "p99_kld": float(np.percentile(scored, 99)),
+                }
+        # No fresh results in this mode — fall back to data carried in from
+        # a prior invocation's JSON (preserves cross-invocation outputs).
+        return self.external_mode_stats.get(mode)
+
+    def merge_external_modes_from_dict(self, existing: dict) -> None:
+        """Splice other-mode data from a previous run's JSON into this result.
+
+        Modes also produced by the current run are NOT overwritten — the
+        fresh in-memory data wins. Used to preserve, for example, the quick
+        summary block when re-running only --long.
+        """
+        if not existing or existing.get("compare_model") != self.compare_model:
+            return
+        existing_by_mode = existing.get("summary_by_mode") or {}
+        current_modes = {r.mode for r in self.prompt_results}
+        for mode in (MODE_SHORT, MODE_LONG):
+            if mode in current_modes:
+                continue
+            stats = existing_by_mode.get(mode)
+            if stats:
+                self.external_mode_stats[mode] = stats
+        # Carry forward the per-prompt detail entries for modes not in the
+        # current run, so the merged JSON keeps both runs' prompt detail.
+        for prompt_entry in existing.get("prompts", []) or []:
+            entry_mode = prompt_entry.get("mode", MODE_SHORT)
+            if entry_mode in current_modes:
+                continue
+            self.external_prompt_entries.append(prompt_entry)
 
     def to_dict(self, detail: bool = True, top_k: int = 0) -> dict:
         """Serialize to a dict for JSON export.
 
         Args:
             detail: If True (default), include per-token KLD arrays, token
-                IDs, and token strings — same shape as the original output
-                format. Set False to emit only summary stats and (optionally)
-                top-K divergent tokens; useful for batch comparisons where
-                per-token data would blow up file size.
+                IDs, and token strings. Set False to emit only summary stats
+                and (optionally) top-K divergent tokens; useful for batch
+                comparisons where per-token data would blow up file size.
             top_k: If > 0, include the top-K most divergent tokens per prompt
-                regardless of detail. Useful for qualitative debugging without
-                emitting full per-token arrays.
+                regardless of detail.
+
+        Output shape:
+            - ``summary``: stats for the primary mode (long if both ran).
+              Existing tools that read ``summary.mean_kld`` keep working.
+            - ``summary_by_mode``: { quick: stats|None, long: stats|None }
+              for stratified analysis when both modes ran.
         """
+        primary = self.primary_mode
+        primary_stats = self.stats_for_mode(primary) or {
+            "num_prompts": 0, "total_tokens": 0, "scored_tokens": 0,
+            "mean_kld": 0.0, "median_kld": 0.0, "std_kld": 0.0, "max_kld": 0.0,
+            "p95_kld": 0.0, "p99_kld": 0.0,
+        }
+        summary = dict(primary_stats)
+        summary["mode"] = primary
+        summary["prefill_tokens_per_second"] = self.prefill_tokens_per_second
+        summary["prefill_seconds"] = self.prefill_seconds
+
         out = {
             "reference_model": self.reference_model,
             "compare_model": self.compare_model,
-            "summary": {
-                "num_prompts": len(self.prompt_results),
-                "total_tokens": self.total_tokens,
-                "mean_kld": self.mean_kld,
-                "median_kld": self.median_kld,
-                "std_kld": self.std_kld,
-                "max_kld": self.max_kld,
-                "p95_kld": self.percentile(95),
-                "p99_kld": self.percentile(99),
-                "prefill_tokens_per_second": self.prefill_tokens_per_second,
-                "prefill_seconds": self.prefill_seconds,
+            "summary": summary,
+            "summary_by_mode": {
+                MODE_SHORT: self.stats_for_mode(MODE_SHORT),
+                MODE_LONG: self.stats_for_mode(MODE_LONG),
             },
             "reference_info": self.reference_info,
             "compare_info": self.compare_info,
@@ -165,7 +331,10 @@ class ComparisonResult:
         for r in self.prompt_results:
             entry = {
                 "prompt": r.prompt,
+                "mode": r.mode,
                 "num_tokens": r.num_tokens,
+                "score_start": r.score_start,
+                "num_scored_tokens": r.num_scored_tokens,
                 "mean_kld": r.mean_kld,
                 "median_kld": r.median_kld,
                 "max_kld": r.max_kld,
@@ -186,6 +355,10 @@ class ComparisonResult:
                 entry["token_ids"] = r.token_ids.tolist()
                 entry["token_strings"] = r.token_strings
             out["prompts"].append(entry)
+        # Merge in prompt entries carried forward from a prior invocation
+        # (modes that weren't re-run this time).
+        for ext_entry in self.external_prompt_entries:
+            out["prompts"].append(dict(ext_entry))
         return out
 
 
